@@ -1,0 +1,45 @@
+﻿goal: top20_push
+model: lgbm
+cv_folds: 5
+cv_seed: 42
+seeds: [42, 2024, 3407]
+feature_set: base
+
+model_params:
+  lgbm:
+    learning_rate: 0.05
+    n_estimators: 600
+    num_leaves: 63
+    min_child_samples: 30
+    feature_fraction: 0.8
+    bagging_fraction: 0.8
+    bagging_freq: 1
+    lambda_l2: 1.0
+  catboost:
+    learning_rate: 0.05
+    iterations: 1500
+    depth: 8
+    l2_leaf_reg: 3.0
+    random_strength: 0.1
+  xgb:
+    learning_rate: 0.05
+    n_estimators: 1200
+    max_depth: 6
+    subsample: 0.8
+    colsample_bytree: 0.8
+    reg_lambda: 1.0
+
+blend:
+  candidates:
+    safe:
+      method: weighted_mean
+      models: [lgbm_3seed, catboost_seed42]
+      weights: [0.45, 0.55]
+    balanced:
+      method: weighted_mean
+      models: [lgbm_3seed, catboost_seed42, xgb_seed42]
+      weights: [0.35, 0.55, 0.10]
+    aggressive:
+      method: rank_mean
+      models: [lgbm_3seed, catboost_seed42, xgb_seed42]
+  submit_order: [safe, balanced, aggressive]

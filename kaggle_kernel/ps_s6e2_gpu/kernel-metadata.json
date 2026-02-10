@@ -1,0 +1,15 @@
+{
+  "id": "chicachan/ps-s6e2-optimized-hybrid-gpu",
+  "title": "PS-S6E2 Optimized Hybrid GPU",
+  "code_file": "train_gpu_catboost.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": "true",
+  "enable_gpu": "true",
+  "enable_tpu": "false",
+  "enable_internet": "false",
+  "dataset_sources": [],
+  "competition_sources": ["playground-series-s6e2"],
+  "kernel_sources": [],
+  "model_sources": []
+}

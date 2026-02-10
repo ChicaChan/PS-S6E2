@@ -1,0 +1,27 @@
+﻿# Python cache
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Local env
+.venv/
+venv/
+
+# Data and artifacts
+data/raw/
+kaggle_outputs/
+submissions/
+catboost_info/
+tmp_kernel/
+
+# Kernel runtime artifacts
+kaggle_kernel/**/output/
+kaggle_kernel/**/__pycache__/
+
+# Logs and archives
+*.log
+*.zip
+
+# OS
+.DS_Store
+Thumbs.db
