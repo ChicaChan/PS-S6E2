@@ -159,3 +159,48 @@ def test_select_submission_candidates_invalid_top_k_raises(tmp_path: Path):
             target_col="Heart Disease",
             top_k=0,
         )
+
+
+def test_load_candidate_scores_prefers_meta_gain_when_present(tmp_path: Path):
+    path = tmp_path / "candidate_scores_cloud.csv"
+    pd.DataFrame(
+        {
+            "candidate": ["a", "b"],
+            "cv_auc": [0.905, 0.904],
+            "submission_file": ["a.csv", "b.csv"],
+            "meta_min_gain": [0.0, 0.001],
+            "meta_mean_gain": [0.0, 0.001],
+        }
+    ).to_csv(path, index=False)
+
+    scores = load_candidate_scores(path)
+    assert scores["candidate"].tolist() == ["b", "a"]
+
+
+def test_select_submission_candidates_respects_min_meta_gain(tmp_path: Path):
+    submissions = tmp_path / "submissions"
+    submissions.mkdir(parents=True, exist_ok=True)
+
+    ids = [1, 2, 3, 4]
+    pd.DataFrame({"id": ids, "Heart Disease": [0.1, 0.2, 0.3, 0.4]}).to_csv(submissions / "a.csv", index=False)
+    pd.DataFrame({"id": ids, "Heart Disease": [0.9, 0.2, 0.8, 0.1]}).to_csv(submissions / "b.csv", index=False)
+
+    scores = pd.DataFrame(
+        {
+            "candidate": ["A", "B"],
+            "cv_auc": [0.905, 0.904],
+            "submission_file": ["a.csv", "b.csv"],
+            "meta_min_gain": [-0.001, 0.002],
+            "meta_mean_gain": [-0.001, 0.002],
+        }
+    )
+
+    selected = select_submission_candidates(
+        candidate_scores=scores,
+        submission_dir=submissions,
+        target_col="Heart Disease",
+        top_k=1,
+        max_correlation=0.998,
+        min_meta_gain=0.0,
+    )
+    assert selected[0]["candidate"] == "B"

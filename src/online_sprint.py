@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 
 REQUIRED_CANDIDATE_COLUMNS = ("candidate", "cv_auc", "submission_file")
+OPTIONAL_META_COLUMNS = ("meta_min_gain", "meta_mean_gain")
 
 
 def load_candidate_scores(path: Path) -> pd.DataFrame:
@@ -16,12 +17,30 @@ def load_candidate_scores(path: Path) -> pd.DataFrame:
     if missing:
         raise ValueError(f"Candidate scores missing required columns: {missing}")
 
-    scores = frame[list(REQUIRED_CANDIDATE_COLUMNS)].copy()
+    selected_columns = list(REQUIRED_CANDIDATE_COLUMNS)
+    for column in OPTIONAL_META_COLUMNS:
+        if column in frame.columns:
+            selected_columns.append(column)
+
+    scores = frame[selected_columns].copy()
     scores["cv_auc"] = pd.to_numeric(scores["cv_auc"], errors="coerce")
     if scores["cv_auc"].isna().any():
         raise ValueError("Candidate scores contain non-numeric cv_auc values")
 
-    return scores.sort_values("cv_auc", ascending=False, kind="mergesort").reset_index(drop=True)
+    for column in OPTIONAL_META_COLUMNS:
+        if column in scores.columns:
+            scores[column] = pd.to_numeric(scores[column], errors="coerce").fillna(-999.0)
+
+    sort_keys = ["cv_auc"]
+    ascending = [False]
+    if "meta_min_gain" in scores.columns:
+        sort_keys.insert(0, "meta_min_gain")
+        ascending.insert(0, False)
+    if "meta_mean_gain" in scores.columns:
+        sort_keys.insert(1 if "meta_min_gain" in scores.columns else 0, "meta_mean_gain")
+        ascending.insert(1 if "meta_min_gain" in scores.columns else 0, False)
+
+    return scores.sort_values(sort_keys, ascending=ascending, kind="mergesort").reset_index(drop=True)
 
 
 def load_prediction_column(path: Path, target_col: str) -> pd.Series:
@@ -85,6 +104,7 @@ def select_submission_candidates(
     target_col: str,
     top_k: int = 2,
     max_correlation: float = 0.998,
+    min_meta_gain: float = -999.0,
 ) -> list[dict[str, object]]:
     if top_k < 1:
         raise ValueError("top_k must be >= 1")
@@ -92,7 +112,13 @@ def select_submission_candidates(
     selected: list[dict[str, object]] = []
     cached_pred: dict[str, pd.Series] = {}
 
-    for row in candidate_scores.sort_values("cv_auc", ascending=False, kind="mergesort").itertuples(index=False):
+    ordered = candidate_scores.sort_values("cv_auc", ascending=False, kind="mergesort")
+    if "meta_min_gain" in candidate_scores.columns:
+        ordered = ordered[ordered["meta_min_gain"] >= min_meta_gain]
+        if ordered.empty:
+            ordered = candidate_scores.sort_values("cv_auc", ascending=False, kind="mergesort")
+
+    for row in ordered.itertuples(index=False):
         candidate_name = str(row.candidate)
         submission_file = str(row.submission_file)
         file_path = submission_dir / submission_file
@@ -142,7 +168,13 @@ def select_submission_candidates(
         return selected
 
     picked_files = {str(item["submission_file"]) for item in selected}
-    for row in candidate_scores.sort_values("cv_auc", ascending=False, kind="mergesort").itertuples(index=False):
+    ordered = candidate_scores.sort_values("cv_auc", ascending=False, kind="mergesort")
+    if "meta_min_gain" in candidate_scores.columns:
+        ordered = ordered[ordered["meta_min_gain"] >= min_meta_gain]
+        if ordered.empty:
+            ordered = candidate_scores.sort_values("cv_auc", ascending=False, kind="mergesort")
+
+    for row in ordered.itertuples(index=False):
         submission_file = str(row.submission_file)
         if submission_file in picked_files:
             continue
@@ -179,6 +211,7 @@ def parse_args() -> argparse.Namespace:
     pick_parser.add_argument("--top-k", type=int, default=2)
     pick_parser.add_argument("--max-correlation", type=float, default=0.998)
     pick_parser.add_argument("--output-path", default="")
+    pick_parser.add_argument("--min-meta-gain", type=float, default=-999.0)
 
     return parser.parse_args()
 
@@ -201,11 +234,13 @@ def run_pick_daily(args: argparse.Namespace) -> None:
         target_col=args.target_col,
         top_k=args.top_k,
         max_correlation=args.max_correlation,
+        min_meta_gain=args.min_meta_gain,
     )
 
     payload = {
         "top_k": args.top_k,
         "max_correlation": args.max_correlation,
+        "min_meta_gain": args.min_meta_gain,
         "selected": selected,
     }
 
