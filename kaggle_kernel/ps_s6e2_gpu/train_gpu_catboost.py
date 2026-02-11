@@ -8,7 +8,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import lightgbm as lgb
 import numpy as np
 import pandas as pd
 from sklearn.metrics import roc_auc_score
@@ -52,9 +51,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cat-seeds", default="42")
     parser.add_argument("--xgb-seeds", default="42")
     parser.add_argument("--cat-l2-grid", default="2.0,3.0,5.0")
-    parser.add_argument("--disable-xgb", action="store_true", default=True)
+    parser.add_argument("--disable-xgb", action="store_true", default=False)
     parser.add_argument("--blend-mode", choices=("weighted", "rank", "auto"), default="auto")
     parser.add_argument("--weight-step", type=float, default=0.025)
+    parser.add_argument("--hybrid-alpha-step", type=float, default=0.05)
+    parser.add_argument("--min-blend-weight", type=float, default=0.05)
     parser.add_argument("--train-path", default="/kaggle/input/playground-series-s6e2/train.csv")
     parser.add_argument("--test-path", default="/kaggle/input/playground-series-s6e2/test.csv")
     parser.add_argument("--sample-sub-path", default="/kaggle/input/playground-series-s6e2/sample_submission.csv")
@@ -191,7 +192,12 @@ def train_lgbm_fold(
     y_valid: pd.Series,
     seed: int,
     params: dict[str, Any],
-) -> lgb.LGBMClassifier:
+):
+    try:
+        import lightgbm as lgb
+    except ImportError as exc:
+        raise RuntimeError("lightgbm is required for lgbm branch training") from exc
+
     config = dict(params)
     config["random_state"] = seed
     model = lgb.LGBMClassifier(**config)
@@ -333,6 +339,10 @@ def rank_mean(preds: list[np.ndarray]) -> np.ndarray:
     return np.mean(np.vstack(ranked), axis=0)
 
 
+def rank_array(pred: np.ndarray) -> np.ndarray:
+    return pd.Series(pred).rank(method="average", pct=True).to_numpy(dtype=np.float64)
+
+
 def search_best_lgb_cat_weight(
     y: pd.Series,
     lgb_oof: np.ndarray,
@@ -360,6 +370,155 @@ def search_best_lgb_cat_weight(
         test_pred=tuned_test,
         cv_auc=float(roc_auc_score(y, tuned_oof)),
         details={"lgb_weight": best_lgb_weight, "cat_weight": 1.0 - best_lgb_weight},
+    )
+
+
+def search_best_lgb_cat_xgb_weight(
+    y: pd.Series,
+    lgb_oof: np.ndarray,
+    cat_oof: np.ndarray,
+    xgb_oof: np.ndarray,
+    lgb_test: np.ndarray,
+    cat_test: np.ndarray,
+    xgb_test: np.ndarray,
+    step: float,
+    min_weight: float,
+) -> CandidateResult:
+    if not (0.0 < min_weight < 0.5):
+        raise ValueError(f"min_weight must be in (0, 0.5), got {min_weight}")
+
+    values = np.arange(min_weight, 1.0 - min_weight + 1e-9, step)
+    best_auc = -1.0
+    best_weights = (0.35, 0.55, 0.10)
+
+    for lgb_weight in values:
+        for cat_weight in values:
+            xgb_weight = 1.0 - float(lgb_weight) - float(cat_weight)
+            if xgb_weight < min_weight:
+                continue
+
+            pred = float(lgb_weight) * lgb_oof + float(cat_weight) * cat_oof + float(xgb_weight) * xgb_oof
+            auc = float(roc_auc_score(y, pred))
+            if auc > best_auc:
+                best_auc = auc
+                best_weights = (float(lgb_weight), float(cat_weight), float(xgb_weight))
+
+    lgb_w, cat_w, xgb_w = best_weights
+    tuned_oof = lgb_w * lgb_oof + cat_w * cat_oof + xgb_w * xgb_oof
+    tuned_test = lgb_w * lgb_test + cat_w * cat_test + xgb_w * xgb_test
+    return CandidateResult(
+        name="tuned_lgb_cat_xgb",
+        oof_pred=tuned_oof,
+        test_pred=tuned_test,
+        cv_auc=float(roc_auc_score(y, tuned_oof)),
+        details={
+            "weights": {"lgbm": lgb_w, "catboost": cat_w, "xgb": xgb_w},
+            "search_step": step,
+            "min_weight": min_weight,
+        },
+    )
+
+
+def search_best_lgb_cat_rank_weight(
+    y: pd.Series,
+    lgb_oof: np.ndarray,
+    cat_oof: np.ndarray,
+    lgb_test: np.ndarray,
+    cat_test: np.ndarray,
+    step: float,
+) -> CandidateResult:
+    result = search_best_lgb_cat_weight(
+        y=y,
+        lgb_oof=rank_array(lgb_oof),
+        cat_oof=rank_array(cat_oof),
+        lgb_test=rank_array(lgb_test),
+        cat_test=rank_array(cat_test),
+        step=step,
+    )
+    return CandidateResult(
+        name="tuned_rank_lgb_cat",
+        oof_pred=result.oof_pred,
+        test_pred=result.test_pred,
+        cv_auc=result.cv_auc,
+        details={
+            "method": "rank_weighted",
+            "weights": {"lgbm": result.details["lgb_weight"], "catboost": result.details["cat_weight"]},
+            "search_step": step,
+        },
+    )
+
+
+def search_best_lgb_cat_xgb_rank_weight(
+    y: pd.Series,
+    lgb_oof: np.ndarray,
+    cat_oof: np.ndarray,
+    xgb_oof: np.ndarray,
+    lgb_test: np.ndarray,
+    cat_test: np.ndarray,
+    xgb_test: np.ndarray,
+    step: float,
+    min_weight: float,
+) -> CandidateResult:
+    result = search_best_lgb_cat_xgb_weight(
+        y=y,
+        lgb_oof=rank_array(lgb_oof),
+        cat_oof=rank_array(cat_oof),
+        xgb_oof=rank_array(xgb_oof),
+        lgb_test=rank_array(lgb_test),
+        cat_test=rank_array(cat_test),
+        xgb_test=rank_array(xgb_test),
+        step=step,
+        min_weight=min_weight,
+    )
+    return CandidateResult(
+        name="tuned_rank_lgb_cat_xgb",
+        oof_pred=result.oof_pred,
+        test_pred=result.test_pred,
+        cv_auc=result.cv_auc,
+        details={
+            "method": "rank_weighted",
+            "weights": result.details["weights"],
+            "search_step": step,
+            "min_weight": min_weight,
+        },
+    )
+
+
+def search_best_weight_rank_hybrid(
+    y: pd.Series,
+    weighted_candidate: CandidateResult,
+    rank_candidate: CandidateResult,
+    alpha_step: float,
+    name: str,
+) -> CandidateResult:
+    if not (0.0 < alpha_step <= 1.0):
+        raise ValueError(f"alpha_step must be in (0, 1], got {alpha_step}")
+
+    values = np.arange(0.0, 1.0 + 1e-9, alpha_step)
+    best_alpha = 0.5
+    best_auc = -1.0
+    for alpha in values:
+        pred = float(alpha) * weighted_candidate.oof_pred + (1.0 - float(alpha)) * rank_candidate.oof_pred
+        auc = float(roc_auc_score(y, pred))
+        if auc > best_auc:
+            best_auc = auc
+            best_alpha = float(alpha)
+
+    blended_oof = best_alpha * weighted_candidate.oof_pred + (1.0 - best_alpha) * rank_candidate.oof_pred
+    blended_test = best_alpha * weighted_candidate.test_pred + (1.0 - best_alpha) * rank_candidate.test_pred
+    return CandidateResult(
+        name=name,
+        oof_pred=blended_oof,
+        test_pred=blended_test,
+        cv_auc=float(roc_auc_score(y, blended_oof)),
+        details={
+            "method": "hybrid_weight_rank",
+            "weighted_source": weighted_candidate.name,
+            "rank_source": rank_candidate.name,
+            "weighted_alpha": best_alpha,
+            "rank_alpha": 1.0 - best_alpha,
+            "alpha_step": alpha_step,
+        },
     )
 
 
@@ -524,14 +683,80 @@ def main() -> None:
     )
     candidates.append(tuned_two)
 
+    tuned_two_rank = search_best_lgb_cat_rank_weight(
+        y=y,
+        lgb_oof=lgbm_result.oof_pred,
+        cat_oof=catboost_result.oof_pred,
+        lgb_test=lgbm_result.test_pred,
+        cat_test=catboost_result.test_pred,
+        step=args.weight_step,
+    )
+    candidates.append(tuned_two_rank)
+
+    hybrid_two = search_best_weight_rank_hybrid(
+        y=y,
+        weighted_candidate=tuned_two,
+        rank_candidate=tuned_two_rank,
+        alpha_step=args.hybrid_alpha_step,
+        name="hybrid_tuned_lgb_cat",
+    )
+    candidates.append(hybrid_two)
+
+    if xgb_result is not None:
+        tuned_three = search_best_lgb_cat_xgb_weight(
+            y=y,
+            lgb_oof=lgbm_result.oof_pred,
+            cat_oof=catboost_result.oof_pred,
+            xgb_oof=xgb_result.oof_pred,
+            lgb_test=lgbm_result.test_pred,
+            cat_test=catboost_result.test_pred,
+            xgb_test=xgb_result.test_pred,
+            step=args.weight_step,
+            min_weight=args.min_blend_weight,
+        )
+        candidates.append(tuned_three)
+
+        tuned_three_rank = search_best_lgb_cat_xgb_rank_weight(
+            y=y,
+            lgb_oof=lgbm_result.oof_pred,
+            cat_oof=catboost_result.oof_pred,
+            xgb_oof=xgb_result.oof_pred,
+            lgb_test=lgbm_result.test_pred,
+            cat_test=catboost_result.test_pred,
+            xgb_test=xgb_result.test_pred,
+            step=args.weight_step,
+            min_weight=args.min_blend_weight,
+        )
+        candidates.append(tuned_three_rank)
+
+        hybrid_three = search_best_weight_rank_hybrid(
+            y=y,
+            weighted_candidate=tuned_three,
+            rank_candidate=tuned_three_rank,
+            alpha_step=args.hybrid_alpha_step,
+            name="hybrid_tuned_lgb_cat_xgb",
+        )
+        candidates.append(hybrid_three)
+
     if args.blend_mode == "weighted":
         candidates = [
             candidate
             for candidate in candidates
-            if candidate.name in ("safe", "balanced", "tuned_lgb_cat")
+            if candidate.name in (
+                "safe",
+                "balanced",
+                "tuned_lgb_cat",
+                "tuned_lgb_cat_xgb",
+                "hybrid_tuned_lgb_cat",
+                "hybrid_tuned_lgb_cat_xgb",
+            )
         ]
     elif args.blend_mode == "rank":
-        candidates = [candidate for candidate in candidates if candidate.name == "aggressive"]
+        candidates = [
+            candidate
+            for candidate in candidates
+            if candidate.name in ("aggressive", "tuned_rank_lgb_cat", "tuned_rank_lgb_cat_xgb")
+        ]
 
     for candidate in candidates:
         save_submission(sample_sub, candidate.test_pred, output_dir / f"submission_{candidate.name}.csv")
@@ -561,6 +786,8 @@ def main() -> None:
         "blend_mode": args.blend_mode,
         "disable_xgb": args.disable_xgb,
         "weight_step": args.weight_step,
+        "hybrid_alpha_step": args.hybrid_alpha_step,
+        "min_blend_weight": args.min_blend_weight,
         "cat_l2_grid": cat_l2_grid,
         "lgbm": {
             "cv_auc": lgbm_result.cv_auc,
