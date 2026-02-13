@@ -46,7 +46,7 @@ class CandidateResult:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="PS-S6E2 cloud rank push trainer")
-    parser.add_argument("--exp-name", default="cloud_round_v13")
+    parser.add_argument("--exp-name", default="cloud_round_v17")
     parser.add_argument("--preset", choices=("fast", "full"), default="full")
     parser.add_argument("--lgb-seeds", default="42,2024,3407")
     parser.add_argument("--cat-seeds", default="42,2024")
@@ -64,8 +64,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-stats-folds", type=int, default=5)
     parser.add_argument("--target-stats-smoothing", type=float, default=20.0)
     parser.add_argument("--target-stats-max-cardinality", type=int, default=256)
-    parser.add_argument("--target-stats-interactions", type=int, default=4)
-    parser.add_argument("--corr-prune-threshold", type=float, default=0.9995)
+    parser.add_argument("--target-stats-interactions", type=int, default=6)
+    parser.add_argument("--target-stats-interactions-grid", default="3,4,6")
+    parser.add_argument("--target-stats-bin-count", type=int, default=12)
+    parser.add_argument("--quantile-grid", default="0.15,0.20,0.25,0.30,0.35,0.40,0.50")
+    parser.add_argument("--global-quantile-grid", default="0.18,0.25,0.33,0.40,0.50")
+    parser.add_argument("--corr-prune-threshold", type=float, default=0.9990)
+    parser.add_argument("--global-corr-prune-threshold", type=float, default=0.9988)
+    parser.add_argument("--candidate-max-corr", type=float, default=0.9985)
+    parser.add_argument("--allow-global-best", action="store_true")
+    parser.add_argument("--anchor-file", default="")
+    parser.add_argument("--anchor-weight-grid", default="0.90,0.93,0.95,0.97")
     parser.add_argument("--train-path", default="/kaggle/input/playground-series-s6e2/train.csv")
     parser.add_argument("--test-path", default="/kaggle/input/playground-series-s6e2/test.csv")
     parser.add_argument("--sample-sub-path", default="/kaggle/input/playground-series-s6e2/sample_submission.csv")
@@ -87,6 +96,13 @@ def parse_float_list(raw: str) -> list[float]:
     if not values:
         raise ValueError("Float list cannot be empty")
     return list(dict.fromkeys(float(item) for item in values))
+
+
+def parse_int_list(raw: str) -> list[int]:
+    values = [item.strip() for item in raw.split(",") if item.strip()]
+    if not values:
+        raise ValueError("Int list cannot be empty")
+    return list(dict.fromkeys(int(item) for item in values))
 
 
 def set_seed(seed: int) -> None:
@@ -132,6 +148,7 @@ def build_target_stat_features(
     smoothing: float,
     max_cardinality: int,
     top_k_interactions: int,
+    bin_count: int,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
     if cv_folds < 2:
         raise ValueError(f"target_stats_folds must be >= 2, got {cv_folds}")
@@ -141,13 +158,43 @@ def build_target_stat_features(
         raise ValueError(f"target_stats_max_cardinality must be >= 2, got {max_cardinality}")
     if top_k_interactions < 0:
         raise ValueError(f"target_stats_interactions must be >= 0, got {top_k_interactions}")
+    if bin_count < 2:
+        raise ValueError(f"target_stats_bin_count must be >= 2, got {bin_count}")
 
     selected_cols = [
         col
         for col in x_train.columns
         if int(x_train[col].nunique(dropna=False)) <= max_cardinality
     ]
-    if not selected_cols:
+
+    stat_source_train = x_train[selected_cols].copy() if selected_cols else pd.DataFrame(index=x_train.index)
+    stat_source_test = x_test[selected_cols].copy() if selected_cols else pd.DataFrame(index=x_test.index)
+
+    binned_columns: list[str] = []
+    for col in x_train.columns:
+        if not pd.api.types.is_numeric_dtype(x_train[col]):
+            continue
+        if int(x_train[col].nunique(dropna=False)) <= max_cardinality:
+            continue
+
+        train_values = pd.to_numeric(x_train[col], errors="coerce").to_numpy(dtype=np.float64)
+        test_values = pd.to_numeric(x_test[col], errors="coerce").to_numpy(dtype=np.float64)
+        if np.isnan(train_values).any() or np.isnan(test_values).any():
+            continue
+
+        edges = np.unique(np.quantile(train_values, np.linspace(0.0, 1.0, bin_count + 1)))
+        if len(edges) <= 2:
+            continue
+
+        inner_edges = edges[1:-1]
+        train_bins = np.digitize(train_values, inner_edges, right=True)
+        test_bins = np.digitize(test_values, inner_edges, right=True)
+        name = f"{col}__bin"
+        stat_source_train[name] = train_bins.astype(np.int32)
+        stat_source_test[name] = test_bins.astype(np.int32)
+        binned_columns.append(name)
+
+    if stat_source_train.empty:
         empty_train = pd.DataFrame(index=x_train.index)
         empty_test = pd.DataFrame(index=x_test.index)
         return (
@@ -156,9 +203,10 @@ def build_target_stat_features(
             {
                 "enabled": True,
                 "selected_columns": [],
+                "binned_columns": [],
                 "interaction_features": [],
                 "generated_feature_count": 0,
-                "message": "no columns passed cardinality filter",
+                "message": "no columns passed cardinality and bin filters",
             },
         )
 
@@ -168,11 +216,11 @@ def build_target_stat_features(
     train_stats: dict[str, np.ndarray] = {}
     test_stats: dict[str, np.ndarray] = {}
 
-    for col in selected_cols:
-        train_col = x_train[col]
-        oof_te = np.full(len(x_train), global_mean, dtype=np.float64)
+    for col in stat_source_train.columns:
+        train_col = stat_source_train[col]
+        oof_te = np.full(len(stat_source_train), global_mean, dtype=np.float64)
 
-        for fold_train_idx, fold_valid_idx in splitter.split(x_train, y):
+        for fold_train_idx, fold_valid_idx in splitter.split(stat_source_train, y):
             fold_train_col = train_col.iloc[fold_train_idx]
             fold_train_target = y.iloc[fold_train_idx]
 
@@ -187,11 +235,11 @@ def build_target_stat_features(
         full_group_sum = y.groupby(train_col).sum()
         full_group_count = y.groupby(train_col).count()
         full_mapping = ((full_group_sum + smoothing * global_mean) / (full_group_count + smoothing)).to_dict()
-        test_te = x_test[col].map(full_mapping).fillna(global_mean).to_numpy(dtype=np.float64)
+        test_te = stat_source_test[col].map(full_mapping).fillna(global_mean).to_numpy(dtype=np.float64)
 
         freq_mapping = train_col.value_counts(normalize=True).to_dict()
         train_freq = train_col.map(freq_mapping).fillna(0.0).to_numpy(dtype=np.float64)
-        test_freq = x_test[col].map(freq_mapping).fillna(0.0).to_numpy(dtype=np.float64)
+        test_freq = stat_source_test[col].map(freq_mapping).fillna(0.0).to_numpy(dtype=np.float64)
 
         train_stats[f"te_{col}"] = oof_te
         test_stats[f"te_{col}"] = test_te
@@ -202,9 +250,10 @@ def build_target_stat_features(
     stat_test = pd.DataFrame(test_stats, index=x_test.index)
 
     interaction_features: list[str] = []
-    if top_k_interactions > 0:
+    te_columns = [column for column in stat_train.columns if column.startswith("te_")]
+    if top_k_interactions > 0 and len(te_columns) >= 2:
         ranked_cols = sorted(
-            [f"te_{col}" for col in selected_cols],
+            te_columns,
             key=lambda col: _safe_abs_corr(stat_train[col].to_numpy(dtype=np.float64), y.to_numpy(dtype=np.float64)),
             reverse=True,
         )
@@ -219,10 +268,12 @@ def build_target_stat_features(
     meta = {
         "enabled": True,
         "selected_columns": selected_cols,
+        "binned_columns": binned_columns,
         "interaction_features": interaction_features,
         "generated_feature_count": int(stat_train.shape[1]),
         "smoothing": float(smoothing),
         "folds": int(cv_folds),
+        "bin_count": int(bin_count),
     }
     return stat_train, stat_test, meta
 
@@ -779,16 +830,112 @@ def save_submission(sample_sub: pd.DataFrame, pred: np.ndarray, output_path: Pat
     print(f"Saved submission: {output_path}")
 
 
-def choose_best(candidates: list[CandidateResult]) -> tuple[CandidateResult, str]:
-    ordered = sorted(
-        candidates,
-        key=lambda item: (
-            float(item.details.get("meta_gate", {}).get("min_gain", -99.0)),
-            float(item.details.get("meta_gate", {}).get("mean_gain", -99.0)),
-            item.cv_auc,
-        ),
-        reverse=True,
+def candidate_priority(item: CandidateResult) -> tuple[float, float, float]:
+    return (
+        float(item.details.get("meta_gate", {}).get("min_gain", -99.0)),
+        float(item.details.get("meta_gate", {}).get("mean_gain", -99.0)),
+        item.cv_auc,
     )
+
+
+def build_robust_pool(candidates: list[CandidateResult]) -> list[CandidateResult]:
+    robust_prefixes = (
+        "safe_",
+        "tuned_lgb_cat_",
+        "aggressive_",
+        "balanced_",
+        "tuned_lgb_cat_xgb_",
+    )
+    return [candidate for candidate in candidates if candidate.name.startswith(robust_prefixes)]
+
+
+def filter_selection_pool(candidates: list[CandidateResult], allow_global_best: bool) -> list[CandidateResult]:
+    if allow_global_best:
+        return list(candidates)
+
+    filtered = [candidate for candidate in candidates if candidate.details.get("scope") != "global_robust"]
+    if filtered:
+        return filtered
+    return list(candidates)
+
+
+def select_candidates_with_diversity(
+    candidates: list[CandidateResult],
+    max_corr: float,
+    max_count: int = 3,
+) -> tuple[list[CandidateResult], list[dict[str, Any]]]:
+    if not candidates:
+        raise ValueError("candidates cannot be empty")
+    if not (0.9 <= max_corr < 1.0):
+        raise ValueError(f"candidate_max_corr must be in [0.9, 1.0), got {max_corr}")
+
+    ordered = sorted(candidates, key=candidate_priority, reverse=True)
+    selected: list[CandidateResult] = []
+    trace: list[dict[str, Any]] = []
+
+    for candidate in ordered:
+        if not selected:
+            selected.append(candidate)
+            trace.append(
+                {
+                    "candidate": candidate.name,
+                    "status": "selected",
+                    "reason": "highest_priority",
+                    "max_corr_to_selected": None,
+                }
+            )
+            continue
+
+        corr_values: list[float] = []
+        for picked in selected:
+            value = np.corrcoef(candidate.oof_pred, picked.oof_pred)[0, 1]
+            if np.isnan(value):
+                value = 1.0
+            corr_values.append(abs(float(value)))
+
+        max_corr_value = max(corr_values)
+        if max_corr_value <= max_corr and len(selected) < max_count:
+            selected.append(candidate)
+            trace.append(
+                {
+                    "candidate": candidate.name,
+                    "status": "selected",
+                    "reason": "diversity_gate_passed",
+                    "max_corr_to_selected": float(max_corr_value),
+                }
+            )
+        else:
+            trace.append(
+                {
+                    "candidate": candidate.name,
+                    "status": "rejected",
+                    "reason": "diversity_gate_failed" if max_corr_value > max_corr else "selection_limit_reached",
+                    "max_corr_to_selected": float(max_corr_value),
+                }
+            )
+
+    if len(selected) < min(max_count, len(ordered)):
+        used = {item.name for item in selected}
+        for candidate in ordered:
+            if candidate.name in used:
+                continue
+            selected.append(candidate)
+            trace.append(
+                {
+                    "candidate": candidate.name,
+                    "status": "selected",
+                    "reason": "fallback_fill",
+                    "max_corr_to_selected": None,
+                }
+            )
+            if len(selected) == min(max_count, len(ordered)):
+                break
+
+    return selected, trace
+
+
+def choose_best(candidates: list[CandidateResult]) -> tuple[CandidateResult, str]:
+    ordered = sorted(candidates, key=candidate_priority, reverse=True)
     best = ordered[0]
     gate = best.details.get("meta_gate", {})
     reason = (
@@ -796,6 +943,11 @@ def choose_best(candidates: list[CandidateResult]) -> tuple[CandidateResult, str
         f"mean_gain={float(gate.get('mean_gain', 0.0)):.6f}, cv_auc={best.cv_auc:.6f}"
     )
     return best, reason
+
+
+def format_quantile_label(value: float) -> str:
+    normalized = f"{value:.4f}".rstrip("0").rstrip(".")
+    return normalized.replace(".", "p")
 
 
 def main() -> None:
@@ -809,93 +961,67 @@ def main() -> None:
 
     y = encode_target(train_df[TARGET_COL])
     base_x, base_x_test = build_feature_frames(train_df, test_df)
-
-    target_stats_meta: dict[str, Any] = {
-        "enabled": not args.disable_target_stats,
-        "selected_columns": [],
-        "interaction_features": [],
-        "generated_feature_count": 0,
-    }
-    if args.disable_target_stats:
-        x, x_test = base_x, base_x_test
-    else:
-        stat_train, stat_test, target_stats_meta = build_target_stat_features(
-            x_train=base_x,
-            x_test=base_x_test,
-            y=y,
-            cv_folds=args.target_stats_folds,
-            cv_seed=args.cv_seed,
-            smoothing=args.target_stats_smoothing,
-            max_cardinality=args.target_stats_max_cardinality,
-            top_k_interactions=args.target_stats_interactions,
-        )
-        x = pd.concat([base_x, stat_train], axis=1)
-        x_test = pd.concat([base_x_test, stat_test], axis=1)
-        print(
-            "[target_stats] added "
-            f"{target_stats_meta.get('generated_feature_count', 0)} features "
-            f"from {len(target_stats_meta.get('selected_columns', []))} columns"
-        )
-
     branch_cfg = build_branch_configs(args)
 
-    lgbm_result = train_branch(
-        "lgbm",
-        branch_cfg["lgbm"],
-        x,
-        y,
-        x_test,
-        cv_folds=args.cv_folds,
-        cv_seed=args.cv_seed,
-    )
-
-    cat_l2_grid = parse_float_list(args.cat_l2_grid)
-    catboost_candidates: list[BranchResult] = []
-    catboost_device = "gpu"
-    for l2 in cat_l2_grid:
-        cat_cfg = BranchConfig(
-            seeds=branch_cfg["catboost"].seeds,
-            params={**branch_cfg["catboost"].params, "l2_leaf_reg": float(l2)},
+    quantile_grid = parse_float_list(args.quantile_grid)
+    global_quantile_grid = parse_float_list(args.global_quantile_grid)
+    if args.disable_target_stats:
+        interaction_grid = [0]
+    else:
+        interaction_grid = (
+            parse_int_list(args.target_stats_interactions_grid)
+            if args.target_stats_interactions_grid
+            else [args.target_stats_interactions]
         )
-        try:
-            result = train_branch(
-                "catboost",
-                cat_cfg,
-                x,
-                y,
-                x_test,
-                cv_folds=args.cv_folds,
-                cv_seed=args.cv_seed,
-                use_gpu_for_catboost=True,
-                meta={"l2_leaf_reg": float(l2), "device": "gpu"},
-            )
-        except Exception as exc:
-            print(f"[catboost] gpu failed at l2={l2}, fallback to cpu: {exc}")
-            catboost_device = "cpu"
-            result = train_branch(
-                "catboost",
-                cat_cfg,
-                x,
-                y,
-                x_test,
-                cv_folds=args.cv_folds,
-                cv_seed=args.cv_seed,
-                use_gpu_for_catboost=False,
-                meta={"l2_leaf_reg": float(l2), "device": "cpu"},
-            )
-        catboost_candidates.append(result)
 
-    catboost_result = max(catboost_candidates, key=lambda item: item.cv_auc)
-    print(
-        f"[catboost] selected l2={catboost_result.meta.get('l2_leaf_reg')} "
-        f"cv_auc={catboost_result.cv_auc:.6f}"
-    )
+    all_candidates: list[CandidateResult] = []
+    feature_grid_results: list[dict[str, Any]] = []
+    quantile_grid_results: list[dict[str, Any]] = []
+    global_quantile_results: list[dict[str, Any]] = []
+    profile_reports: dict[str, dict[str, Any]] = {}
 
-    xgb_result: BranchResult | None = None
-    if not args.disable_xgb:
-        xgb_result = train_branch(
-            "xgb",
-            branch_cfg["xgb"],
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    for interactions in interaction_grid:
+        profile_name = "base" if args.disable_target_stats else f"ts_i{interactions}"
+        target_stats_meta: dict[str, Any]
+        if args.disable_target_stats:
+            x = base_x
+            x_test = base_x_test
+            target_stats_meta = {
+                "enabled": False,
+                "selected_columns": [],
+                "binned_columns": [],
+                "interaction_features": [],
+                "generated_feature_count": 0,
+                "profile_name": profile_name,
+            }
+        else:
+            stat_train, stat_test, target_stats_meta = build_target_stat_features(
+                x_train=base_x,
+                x_test=base_x_test,
+                y=y,
+                cv_folds=args.target_stats_folds,
+                cv_seed=args.cv_seed,
+                smoothing=args.target_stats_smoothing,
+                max_cardinality=args.target_stats_max_cardinality,
+                top_k_interactions=interactions,
+                bin_count=args.target_stats_bin_count,
+            )
+            x = pd.concat([base_x, stat_train], axis=1)
+            x_test = pd.concat([base_x_test, stat_test], axis=1)
+            target_stats_meta["profile_name"] = profile_name
+            target_stats_meta["interactions"] = interactions
+            print(
+                f"[target_stats:{profile_name}] added "
+                f"{target_stats_meta.get('generated_feature_count', 0)} features "
+                f"from {len(target_stats_meta.get('selected_columns', []))} columns"
+            )
+
+        lgbm_result = train_branch(
+            "lgbm",
+            branch_cfg["lgbm"],
             x,
             y,
             x_test,
@@ -903,120 +1029,260 @@ def main() -> None:
             cv_seed=args.cv_seed,
         )
 
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    save_submission(sample_sub, lgbm_result.test_pred, output_dir / "submission_lgbm_3seed.csv")
-    save_submission(sample_sub, catboost_result.test_pred, output_dir / "submission_catboost.csv")
-    if xgb_result is not None:
-        save_submission(sample_sub, xgb_result.test_pred, output_dir / "submission_xgb.csv")
-
-    all_candidates: list[CandidateResult] = []
-
-    safe_oof = weighted([lgbm_result.oof_pred, catboost_result.oof_pred], [0.5, 0.5])
-    safe_test = weighted([lgbm_result.test_pred, catboost_result.test_pred], [0.5, 0.5])
-    safe = CandidateResult(
-        name="safe",
-        oof_pred=safe_oof,
-        test_pred=safe_test,
-        cv_auc=float(roc_auc_score(y, safe_oof)),
-        details={"weights": {"lgbm": 0.5, "catboost": 0.5}},
-    )
-    all_candidates.append(safe)
-
-    tuned_lgb_cat = search_best_lgb_cat_weight(
-        y=y,
-        lgb_oof=lgbm_result.oof_pred,
-        cat_oof=catboost_result.oof_pred,
-        lgb_test=lgbm_result.test_pred,
-        cat_test=catboost_result.test_pred,
-        step=args.weight_step,
-    )
-    all_candidates.append(tuned_lgb_cat)
-
-    aggressive = search_best_lgb_cat_rank_weight(
-        y=y,
-        lgb_oof=lgbm_result.oof_pred,
-        cat_oof=catboost_result.oof_pred,
-        lgb_test=lgbm_result.test_pred,
-        cat_test=catboost_result.test_pred,
-        step=args.weight_step,
-    )
-    aggressive.name = "aggressive"
-    all_candidates.append(aggressive)
-
-    if xgb_result is not None:
-        if xgb_result.cv_auc >= min(lgbm_result.cv_auc, catboost_result.cv_auc) - 0.00015:
-            balanced_oof = weighted(
-                [lgbm_result.oof_pred, catboost_result.oof_pred, xgb_result.oof_pred],
-                [0.35, 0.55, 0.10],
+        cat_l2_grid = parse_float_list(args.cat_l2_grid)
+        catboost_candidates: list[BranchResult] = []
+        catboost_device = "gpu"
+        for l2 in cat_l2_grid:
+            cat_cfg = BranchConfig(
+                seeds=branch_cfg["catboost"].seeds,
+                params={**branch_cfg["catboost"].params, "l2_leaf_reg": float(l2)},
             )
-            balanced_test = weighted(
-                [lgbm_result.test_pred, catboost_result.test_pred, xgb_result.test_pred],
-                [0.35, 0.55, 0.10],
+            try:
+                result = train_branch(
+                    "catboost",
+                    cat_cfg,
+                    x,
+                    y,
+                    x_test,
+                    cv_folds=args.cv_folds,
+                    cv_seed=args.cv_seed,
+                    use_gpu_for_catboost=True,
+                    meta={"l2_leaf_reg": float(l2), "device": "gpu"},
+                )
+            except Exception as exc:
+                print(f"[catboost] gpu failed at l2={l2}, fallback to cpu: {exc}")
+                catboost_device = "cpu"
+                result = train_branch(
+                    "catboost",
+                    cat_cfg,
+                    x,
+                    y,
+                    x_test,
+                    cv_folds=args.cv_folds,
+                    cv_seed=args.cv_seed,
+                    use_gpu_for_catboost=False,
+                    meta={"l2_leaf_reg": float(l2), "device": "cpu"},
+                )
+            catboost_candidates.append(result)
+
+        catboost_result = max(catboost_candidates, key=lambda item: item.cv_auc)
+        print(
+            f"[catboost:{profile_name}] selected l2={catboost_result.meta.get('l2_leaf_reg')} "
+            f"cv_auc={catboost_result.cv_auc:.6f}"
+        )
+
+        xgb_result: BranchResult | None = None
+        if not args.disable_xgb:
+            xgb_result = train_branch(
+                "xgb",
+                branch_cfg["xgb"],
+                x,
+                y,
+                x_test,
+                cv_folds=args.cv_folds,
+                cv_seed=args.cv_seed,
             )
-            all_candidates.append(
-                CandidateResult(
-                    name="balanced",
+
+        save_submission(sample_sub, lgbm_result.test_pred, output_dir / f"submission_lgbm_3seed_{profile_name}.csv")
+        save_submission(sample_sub, catboost_result.test_pred, output_dir / f"submission_catboost_{profile_name}.csv")
+        if xgb_result is not None:
+            save_submission(sample_sub, xgb_result.test_pred, output_dir / f"submission_xgb_{profile_name}.csv")
+
+        profile_candidates: list[CandidateResult] = []
+
+        safe_oof = weighted([lgbm_result.oof_pred, catboost_result.oof_pred], [0.5, 0.5])
+        safe_test = weighted([lgbm_result.test_pred, catboost_result.test_pred], [0.5, 0.5])
+        safe = CandidateResult(
+            name=f"safe_{profile_name}",
+            oof_pred=safe_oof,
+            test_pred=safe_test,
+            cv_auc=float(roc_auc_score(y, safe_oof)),
+            details={"weights": {"lgbm": 0.5, "catboost": 0.5}},
+        )
+        profile_candidates.append(safe)
+
+        tuned_lgb_cat = search_best_lgb_cat_weight(
+            y=y,
+            lgb_oof=lgbm_result.oof_pred,
+            cat_oof=catboost_result.oof_pred,
+            lgb_test=lgbm_result.test_pred,
+            cat_test=catboost_result.test_pred,
+            step=args.weight_step,
+        )
+        tuned_lgb_cat.name = f"tuned_lgb_cat_{profile_name}"
+        profile_candidates.append(tuned_lgb_cat)
+
+        aggressive = search_best_lgb_cat_rank_weight(
+            y=y,
+            lgb_oof=lgbm_result.oof_pred,
+            cat_oof=catboost_result.oof_pred,
+            lgb_test=lgbm_result.test_pred,
+            cat_test=catboost_result.test_pred,
+            step=args.weight_step,
+        )
+        aggressive.name = f"aggressive_{profile_name}"
+        profile_candidates.append(aggressive)
+
+        if xgb_result is not None:
+            if xgb_result.cv_auc >= min(lgbm_result.cv_auc, catboost_result.cv_auc) - 0.00015:
+                balanced_oof = weighted(
+                    [lgbm_result.oof_pred, catboost_result.oof_pred, xgb_result.oof_pred],
+                    [0.35, 0.55, 0.10],
+                )
+                balanced_test = weighted(
+                    [lgbm_result.test_pred, catboost_result.test_pred, xgb_result.test_pred],
+                    [0.35, 0.55, 0.10],
+                )
+                balanced = CandidateResult(
+                    name=f"balanced_{profile_name}",
                     oof_pred=balanced_oof,
                     test_pred=balanced_test,
                     cv_auc=float(roc_auc_score(y, balanced_oof)),
                     details={"weights": {"lgbm": 0.35, "catboost": 0.55, "xgb": 0.10}},
                 )
-            )
+                profile_candidates.append(balanced)
 
-            tuned_three = search_best_lgb_cat_xgb_weight(
+                tuned_three = search_best_lgb_cat_xgb_weight(
+                    y=y,
+                    lgb_oof=lgbm_result.oof_pred,
+                    cat_oof=catboost_result.oof_pred,
+                    xgb_oof=xgb_result.oof_pred,
+                    lgb_test=lgbm_result.test_pred,
+                    cat_test=catboost_result.test_pred,
+                    xgb_test=xgb_result.test_pred,
+                    step=args.weight_step,
+                    min_weight=args.min_blend_weight,
+                )
+                tuned_three.name = f"tuned_lgb_cat_xgb_{profile_name}"
+                profile_candidates.append(tuned_three)
+            else:
+                print(
+                    "[xgb] skipped in candidate generation due to weak cv signal: "
+                    f"xgb={xgb_result.cv_auc:.6f}, lgb={lgbm_result.cv_auc:.6f}, cat={catboost_result.cv_auc:.6f}"
+                )
+
+        robust_pool = build_robust_pool(profile_candidates)
+        for quantile in quantile_grid:
+            if len(robust_pool) < 2:
+                break
+            label = format_quantile_label(quantile)
+            quantile_candidate = build_corr_prune_quantile_candidate(
                 y=y,
-                lgb_oof=lgbm_result.oof_pred,
-                cat_oof=catboost_result.oof_pred,
-                xgb_oof=xgb_result.oof_pred,
-                lgb_test=lgbm_result.test_pred,
-                cat_test=catboost_result.test_pred,
-                xgb_test=xgb_result.test_pred,
-                step=args.weight_step,
-                min_weight=args.min_blend_weight,
+                candidates=robust_pool,
+                quantile=quantile,
+                max_corr=args.corr_prune_threshold,
+                name=f"robust_q{label}_{profile_name}",
             )
-            all_candidates.append(tuned_three)
-        else:
-            print(
-                "[xgb] skipped in candidate generation due to weak cv signal: "
-                f"xgb={xgb_result.cv_auc:.6f}, lgb={lgbm_result.cv_auc:.6f}, cat={catboost_result.cv_auc:.6f}"
+            profile_candidates.append(quantile_candidate)
+            quantile_grid_results.append(
+                {
+                    "profile": profile_name,
+                    "quantile": float(quantile),
+                    "candidate": quantile_candidate.name,
+                    "cv_auc": quantile_candidate.cv_auc,
+                }
             )
 
-    robust_pool_names = {"safe", "tuned_lgb_cat", "aggressive", "balanced", "tuned_lgb_cat_xgb"}
-    robust_pool = [candidate for candidate in all_candidates if candidate.name in robust_pool_names]
-    if len(robust_pool) >= 2:
-        robust_median = build_corr_prune_quantile_candidate(
-            y=y,
-            candidates=robust_pool,
-            quantile=0.5,
-            max_corr=args.corr_prune_threshold,
-            name="robust_median",
-        )
-        robust_p25 = build_corr_prune_quantile_candidate(
-            y=y,
-            candidates=robust_pool,
-            quantile=0.25,
-            max_corr=args.corr_prune_threshold,
-            name="robust_p25",
-        )
-        all_candidates.extend([robust_median, robust_p25])
-
-    if args.blend_mode == "weighted":
-        all_candidates = [
-            candidate
-            for candidate in all_candidates
-            if candidate.name in (
-                "safe",
-                "tuned_lgb_cat",
-                "balanced",
-                "tuned_lgb_cat_xgb",
-                "robust_median",
-                "robust_p25",
+        if args.blend_mode == "weighted":
+            weighted_names = {
+                f"safe_{profile_name}",
+                f"tuned_lgb_cat_{profile_name}",
+                f"balanced_{profile_name}",
+                f"tuned_lgb_cat_xgb_{profile_name}",
+            }
+            weighted_names.update(
+                candidate.name for candidate in profile_candidates if candidate.name.startswith(f"robust_q")
             )
+            profile_candidates = [candidate for candidate in profile_candidates if candidate.name in weighted_names]
+        elif args.blend_mode == "rank":
+            profile_candidates = [candidate for candidate in profile_candidates if candidate.name == f"aggressive_{profile_name}"]
+
+        for candidate in profile_candidates:
+            candidate.details["feature_profile"] = profile_name
+            candidate.details["target_stats"] = target_stats_meta
+            candidate.details["source_mix"] = "internal"
+            save_submission(sample_sub, candidate.test_pred, output_dir / f"submission_{candidate.name}.csv")
+
+        feature_grid_results.append(
+            {
+                "profile": profile_name,
+                "target_stats_interactions": interactions,
+                "feature_count": int(x.shape[1]),
+                "target_stats_features": int(target_stats_meta.get("generated_feature_count", 0)),
+                "best_candidate_cv": float(max(candidate.cv_auc for candidate in profile_candidates)),
+                "lgbm_cv_auc": lgbm_result.cv_auc,
+                "catboost_cv_auc": catboost_result.cv_auc,
+                "xgb_cv_auc": xgb_result.cv_auc if xgb_result is not None else None,
+            }
+        )
+
+        profile_reports[profile_name] = {
+            "lgbm_result": lgbm_result,
+            "catboost_result": catboost_result,
+            "xgb_result": xgb_result,
+            "catboost_candidates": catboost_candidates,
+            "catboost_device": catboost_device,
+            "target_stats_meta": target_stats_meta,
+        }
+        all_candidates.extend(profile_candidates)
+
+    all_candidate_by_name = {candidate.name: candidate for candidate in all_candidates}
+    global_robust_pool = build_robust_pool(all_candidates)
+    for quantile in global_quantile_grid:
+        if len(global_robust_pool) < 2:
+            break
+        label = format_quantile_label(quantile)
+        global_candidate = build_corr_prune_quantile_candidate(
+            y=y,
+            candidates=global_robust_pool,
+            quantile=quantile,
+            max_corr=args.global_corr_prune_threshold,
+            name=f"global_robust_q{label}",
+        )
+        source_candidates = [
+            all_candidate_by_name[name]
+            for name in global_candidate.details.get("kept_candidates", [])
+            if name in all_candidate_by_name
         ]
-    elif args.blend_mode == "rank":
-        all_candidates = [candidate for candidate in all_candidates if candidate.name == "aggressive"]
+        source_profiles = sorted({
+            str(candidate.details.get("feature_profile", ""))
+            for candidate in source_candidates
+            if candidate.details.get("feature_profile")
+        })
+        if source_candidates:
+            primary_source = max(source_candidates, key=candidate_priority)
+            primary_profile = str(primary_source.details.get("feature_profile", "base"))
+        else:
+            primary_profile = "base"
+
+        global_candidate.details["feature_profile"] = primary_profile
+        global_candidate.details["target_stats"] = {
+            "enabled": True,
+            "profile_name": primary_profile,
+            "scope": "global_robust",
+            "source_profiles": source_profiles,
+        }
+        global_candidate.details["source_profiles"] = source_profiles
+        global_candidate.details["scope"] = "global_robust"
+        global_candidate.details["source_mix"] = "mixed"
+
+        save_submission(sample_sub, global_candidate.test_pred, output_dir / f"submission_{global_candidate.name}.csv")
+        all_candidates.append(global_candidate)
+        all_candidate_by_name[global_candidate.name] = global_candidate
+        global_quantile_results.append(
+            {
+                "quantile": float(quantile),
+                "candidate": global_candidate.name,
+                "cv_auc": global_candidate.cv_auc,
+                "source_profiles": source_profiles,
+                "primary_profile": primary_profile,
+            }
+        )
+
+    baseline_candidates = [candidate for candidate in all_candidates if candidate.name.startswith("safe_")]
+    if not baseline_candidates:
+        raise RuntimeError("No safe baseline candidate generated")
+    baseline_candidate = max(baseline_candidates, key=lambda item: item.cv_auc)
 
     meta_splits = build_meta_splits(
         y=y,
@@ -1024,20 +1290,52 @@ def main() -> None:
         seed_b=args.meta_seed_b,
         test_size=args.meta_test_size,
     )
-    attach_meta_stability(y=y, baseline_oof=safe.oof_pred, candidates=all_candidates, splits=meta_splits)
+    attach_meta_stability(y=y, baseline_oof=baseline_candidate.oof_pred, candidates=all_candidates, splits=meta_splits)
 
-    selected_candidates = filter_candidates_by_meta(
+    selected_by_meta = filter_candidates_by_meta(
         candidates=all_candidates,
-        baseline_name="safe",
+        baseline_name=baseline_candidate.name,
         min_gain=args.meta_min_gain,
     )
-
-    for candidate in all_candidates:
-        save_submission(sample_sub, candidate.test_pred, output_dir / f"submission_{candidate.name}.csv")
+    selection_pool = filter_selection_pool(selected_by_meta, allow_global_best=args.allow_global_best)
+    selected_candidates, selection_trace = select_candidates_with_diversity(
+        candidates=selection_pool,
+        max_corr=args.candidate_max_corr,
+        max_count=3,
+    )
 
     best_candidate, selected_reason = choose_best(selected_candidates)
     best_path = output_dir / f"submission_{best_candidate.name}.csv"
     pd.read_csv(best_path).to_csv(output_dir / "submission_best.csv", index=False)
+
+    anchor_blend_results: list[dict[str, Any]] = []
+    if args.anchor_file:
+        anchor_path = Path(args.anchor_file)
+        if anchor_path.exists():
+            anchor_frame = pd.read_csv(anchor_path)
+            if ID_COL not in anchor_frame.columns or TARGET_COL not in anchor_frame.columns:
+                raise ValueError(f"Anchor file missing required columns: {args.anchor_file}")
+            if not np.array_equal(anchor_frame[ID_COL].to_numpy(), sample_sub[ID_COL].to_numpy()):
+                raise ValueError("Anchor file id order does not match sample submission")
+            anchor_pred = pd.to_numeric(anchor_frame[TARGET_COL], errors="coerce")
+            if anchor_pred.isna().any():
+                raise ValueError("Anchor file contains non-numeric predictions")
+
+            for weight in parse_float_list(args.anchor_weight_grid):
+                if not (0.0 <= weight <= 1.0):
+                    raise ValueError(f"anchor weight must be in [0, 1], got {weight}")
+                blended = weight * anchor_pred.to_numpy(dtype=np.float64) + (1.0 - weight) * best_candidate.test_pred
+                file_name = f"submission_anchor_w{int(round(weight * 100)):02d}_{best_candidate.name}.csv"
+                save_submission(sample_sub, np.clip(blended, 0.0, 1.0), output_dir / file_name)
+                anchor_blend_results.append(
+                    {
+                        "weight": float(weight),
+                        "submission_file": file_name,
+                        "source_candidate": best_candidate.name,
+                    }
+                )
+        else:
+            print(f"[anchor] skipped because file does not exist: {anchor_path}")
 
     candidate_scores = pd.DataFrame(
         [
@@ -1047,12 +1345,35 @@ def main() -> None:
                 "submission_file": f"submission_{candidate.name}.csv",
                 "meta_min_gain": float(candidate.details.get("meta_gate", {}).get("min_gain", 0.0)),
                 "meta_mean_gain": float(candidate.details.get("meta_gate", {}).get("mean_gain", 0.0)),
+                "feature_profile": candidate.details.get("feature_profile", ""),
+                "scope": candidate.details.get("scope", "profile"),
+                "source_mix": candidate.details.get("source_mix", "internal"),
                 "details": json.dumps(candidate.details, ensure_ascii=False),
             }
             for candidate in sorted(all_candidates, key=lambda item: item.cv_auc, reverse=True)
         ]
     )
     candidate_scores.to_csv(output_dir / "candidate_scores_cloud.csv", index=False)
+
+    best_profile = str(best_candidate.details.get("feature_profile", "base"))
+    report = profile_reports.get(best_profile)
+    if report is None:
+        raise RuntimeError(f"Missing profile report for {best_profile}")
+
+    lgbm_result = report["lgbm_result"]
+    catboost_result = report["catboost_result"]
+    xgb_result = report["xgb_result"]
+    catboost_candidates = report["catboost_candidates"]
+    catboost_device = report["catboost_device"]
+    target_stats_meta = report["target_stats_meta"]
+    internal_best_set = [
+        candidate.name
+        for candidate in sorted(
+            [candidate for candidate in all_candidates if candidate.details.get("scope") != "global_robust"],
+            key=candidate_priority,
+            reverse=True,
+        )[:5]
+    ]
 
     metrics: dict[str, Any] = {
         "exp_name": args.exp_name,
@@ -1063,13 +1384,27 @@ def main() -> None:
         "disable_xgb": args.disable_xgb,
         "weight_step": args.weight_step,
         "min_blend_weight": args.min_blend_weight,
-        "cat_l2_grid": cat_l2_grid,
+        "cat_l2_grid": parse_float_list(args.cat_l2_grid),
         "meta_seed_a": args.meta_seed_a,
         "meta_seed_b": args.meta_seed_b,
         "meta_test_size": args.meta_test_size,
         "meta_min_gain": args.meta_min_gain,
         "corr_prune_threshold": args.corr_prune_threshold,
+        "global_corr_prune_threshold": args.global_corr_prune_threshold,
+        "candidate_max_corr": args.candidate_max_corr,
+        "allow_global_best": args.allow_global_best,
+        "quantile_grid": quantile_grid,
+        "global_quantile_grid": global_quantile_grid,
+        "feature_grid_results": feature_grid_results,
+        "quantile_grid_results": quantile_grid_results,
+        "global_quantile_results": global_quantile_results,
+        "selection_trace": selection_trace,
+        "anchor_blend_results": anchor_blend_results,
         "target_stats": target_stats_meta,
+        "best_profile": best_profile,
+        "internal_best_set": internal_best_set,
+        "selection_pool": [candidate.name for candidate in selection_pool],
+        "baseline_candidate": baseline_candidate.name,
         "lgbm": {
             "cv_auc": lgbm_result.cv_auc,
             "seed_aucs": lgbm_result.seed_aucs,
